@@ -1243,8 +1243,6 @@ class OriginActor {
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
-			// Clean up retry metadata when turn settles successfully.
-			this.#manager.database.metaDelete(`turn_submit_retry_count:${opRef}`);
 		} catch (error) {
 			// Only the established session_unavailable status proves this send did
 			// not land. A session_not_found returned after port.send is ambiguous:
@@ -1315,21 +1313,28 @@ class OriginActor {
 			bound.openTool
 		)
 			return false;
-		// Check if we've already attempted a retry for this turn.
-		const key = `turn_submit_retry_count:${bound.turn.opRef}`;
+		// Check if we've already attempted a retry for this message.
+		const key = `turn_submit_retry_count:${bound.turn.triggerMessageId}`;
 		const retryAttempted = this.#manager.database.metaGet(key) === "1";
 		return !retryAttempted;
 	}
 	
 	/** Mark the turn for retry and prevent its settlement. */
-	#markSubmissionForRetry(bound: BoundTurn): void {
-		const key = `turn_submit_retry_count:${bound.turn.opRef}`;
+	async #markSubmissionForRetry(bound: BoundTurn): Promise<void> {
+		const key = `turn_submit_retry_count:${bound.turn.triggerMessageId}`;
 		this.#manager.database.metaSet(key, "1");
 		this.#manager.log(
 			`turn_submit_retry_attempt origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef}`,
 		);
-		// Set tail terminal to false to prevent settlement and allow re-reconciliation.
-		bound.tailTerminalObserved = false;
+		// Requeue the trigger message for a fresh dispatch with a new attempt number.
+		this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
+		// Detach the current binding so the origin can dispatch the next attempt.
+		if (this.#current === bound) {
+			this.#current = undefined;
+			this.#state = "idle";
+			// Schedule the next dispatch after this work completes.
+			void this.enqueue(async () => await this.#dispatchNext()).catch(() => {});
+		}
 	}
 
 	/**
@@ -2259,6 +2264,29 @@ class OriginActor {
 					"error",
 				);
 				failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
+				// Check for submission failure retry opportunity: if nothing was delivered and
+				// this is an internal submission failure, attempt the retry once before resetting.
+				const retryConditionsMet = await this.#checkSubmissionRetryConditions(bound, report);
+				if (retryConditionsMet) {
+					await this.#markSubmissionForRetry(bound);
+					return; // Don't settle or call onFailure; let the turn stay in queue for re-send.
+				}
+				// If a reply was already delivered to the user on an internal submission failure,
+				// treat the turn as successful since the user got their answer.
+				if ((bound.replyVisible || bound.lastAssistantText) && 
+					report.status.outcome?.code === "internal" && 
+					report.status.outcome?.phase === "submission") {
+					const text = bound.lastAssistantText || "";
+					if (text) {
+						await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
+						if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound")
+							this.#manager.database.inboundTurnAccept(bound.turn.opRef);
+						this.#manager.database.inboundTurnComplete(bound.turn.opRef);
+						await this.#notifySettled(bound);
+						await this.#settleAfterTerminal(bound);
+						return;
+					}
+				}
 				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
 				await bound.lifecycle.onFailure?.({
 					...bound,
@@ -2273,13 +2301,6 @@ class OriginActor {
 				"error",
 			);
 			throw error;
-		}
-		// Check for submission failure retry opportunity: if nothing was delivered and
-		// this is an internal submission failure, attempt the retry once before resetting.
-		const retryConditionsMet = await this.#checkSubmissionRetryConditions(bound, report);
-		if (retryConditionsMet) {
-			this.#markSubmissionForRetry(bound);
-			return; // Don't settle; let the turn stay in queue for re-send.
 		}
 		// Persist the failure notice before settling its trigger. If delivery fails,
 		// recovery can retry the same deterministic notice without losing it. Reset
@@ -2378,8 +2399,6 @@ class OriginActor {
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
-		// Clean up retry metadata when turn settles.
-		this.#manager.database.metaDelete(`turn_submit_retry_count:${bound.turn.opRef}`);
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "terminal");
 		this.#clearRetiredReattach(bound);
